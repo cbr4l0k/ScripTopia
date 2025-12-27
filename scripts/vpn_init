@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 1) Remove all existing VPN connections (TYPE=vpn)
+mapfile -t VPN_CONNS < <(nmcli -t -f NAME,TYPE connection show | awk -F: '$2=="vpn"{print $1}')
+if ((${#VPN_CONNS[@]})); then
+  echo "Removing existing VPN connections:"
+  for c in "${VPN_CONNS[@]}"; do
+    echo "  - $c"
+    sudo nmcli connection delete "$c" >/dev/null
+  done
+else
+  echo "No existing VPN connections found."
+fi
+
+# 2) Read credentials once
+read -r -p "OpenVPN username: " OVPN_USER
+read -r -s -p "OpenVPN password: " OVPN_PASS
+echo
+
+# 3) Import + rename + apply creds to each ProtonVPN profile
+shopt -s nullglob
+for f in ~/Downloads/*.protonvpn.tcp.ovpn; do
+  cc="${f%%.*}"       # at, au, ...
+  base="${f%.ovpn}"   # at.protonvpn.tcp
+
+  echo "Importing $f -> $cc"
+
+  sudo nmcli connection import type openvpn file "$f"
+
+  # Rename to 2-letter lowercase
+  sudo nmcli connection modify "$base" connection.id "$cc"
+
+  # Ensure NM uses username/password auth mode, and *stores* the password
+  sudo nmcli connection modify "$cc" vpn.user-name "$OVPN_USER"
+  sudo nmcli connection modify "$cc" +vpn.data "connection-type=password-tls"
+  sudo nmcli connection modify "$cc" +vpn.data "password-flags=0"
+
+  # Set the secret (password) explicitly
+  sudo nmcli connection modify "$cc" vpn.secrets "password=$OVPN_PASS"
+
+  # Optional: allow all users to use the connection (system-wide)
+  sudo nmcli connection modify "$cc" connection.permissions ""
+done
+
+echo "Done. Example: nmcli con up dk"
