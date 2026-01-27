@@ -1,0 +1,6 @@
+#!/bin/bash
+# ytrss - "YouTube RSS" - Turn a YouTube channel ID into an RSS feed URL
+
+[ -z "$1" ] && echo "Usage: ytrss <channel_id>" && exit 1
+
+echo "https://www.youtube.com/feeds/videos.xml?channel_id=$1"
