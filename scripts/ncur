@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# ncur - Set current directory as the note capture folder
+
+VAULT_ROOT="/home/cbr4l0k/Documents/mind"
+CONFIG_FILE="$VAULT_ROOT/98xResources/Config/template-config.json"
+
+# Check if we're inside the vault
+if [[ "$PWD" != "$VAULT_ROOT"* ]]; then
+    echo "Error: Not inside the vault ($VAULT_ROOT)"
+    exit 1
+fi
+
+# Get relative path from vault root
+REL_PATH="${PWD#$VAULT_ROOT/}"
+
+# Handle being at vault root
+if [[ "$REL_PATH" == "$PWD" ]]; then
+    REL_PATH="."
+fi
+
+# Update config using jq
+if command -v jq &> /dev/null; then
+    jq --arg path "$REL_PATH" '.folders.captures = $path' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" \
+        && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    echo "Note folder set to: $REL_PATH"
+else
+    echo "Error: jq is required. Install with: sudo pacman -S jq"
+    exit 1
+fi
