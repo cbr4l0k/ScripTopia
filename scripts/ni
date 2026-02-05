@@ -1,0 +1,4 @@
+#!/bin/bash
+# ni - "Name It" - Convert string to clean underscore-separated title
+
+echo "$*" | tr '[:upper:]' '[:lower:]' | tr ' ' '_' | tr -cd 'a-z0-9_' | tr -s '_'
