@@ -1,0 +1,5 @@
+
+# secrets (added during reorg 2026-10-14)
+.env
+.env.*
+!.env.example

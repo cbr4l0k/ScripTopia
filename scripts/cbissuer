@@ -1,0 +1,537 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  cbissuer \
+    --owner <owner> \
+    --repo <repo> \
+    --project-id <id> \
+    --input <issues.json> \
+    [--api-base <url>] \
+    [--token-env <ENV_VAR>] \
+    [--dry-run]
+
+Required:
+  --owner        Repository owner/user/org
+  --repo         Repository name
+  --project-id   Repository-scoped project numeric ID
+  --input        JSON file containing an array of issue objects
+
+Optional:
+  --api-base     API base URL (default: https://codeberg.org/api/v1)
+  --token-env    Token env var name (default: CODEBERG_TOKEN)
+  --dry-run      Print actions without creating or updating anything
+
+Behavior:
+  - Missing labels found in the built-in catalog are auto-created.
+  - Missing labels not found in the catalog are warned and skipped.
+
+Input item shape (minimum):
+  {
+    "id": "F-001-01",
+    "feature": "F-001",
+    "title": "[F-001-01] Some title",
+    "body": "Markdown body",
+    "labels": ["core", "layer-1"],
+    "depends_on": []
+  }
+USAGE
+}
+
+log() {
+  printf '%s\n' "$*"
+}
+
+err() {
+  printf 'ERROR: %s\n' "$*" >&2
+}
+
+require_cmd() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || {
+    err "Missing required command: $cmd"
+    exit 1
+  }
+}
+
+urlencode() {
+  jq -rn --arg v "$1" '$v|@uri'
+}
+
+LABEL_CATALOG_JSON=$(cat <<'JSON'
+[
+  {"name":"core","color":"e11d48","description":"Foundational modules the entire system depends on. If these break, everything breaks."},
+  {"name":"database","color":"dc2626","description":"Involves schema design, data modeling, or persistent storage concerns."},
+  {"name":"data-model","color":"f97316","description":"Defines or modifies the structure of a business entity (OS, vehicle, driver, etc.)."},
+  {"name":"auth","color":"7c3aed","description":"Authentication, authorization, role definitions, or permission scoping."},
+  {"name":"workflow","color":"2563eb","description":"Business process logic - state machines, transitions, multi-step flows."},
+  {"name":"dashboard","color":"0891b2","description":"User-facing operational views, boards, or real-time status screens."},
+  {"name":"scheduling","color":"0d9488","description":"Time-window management, availability checks, conflict detection, assignment logic."},
+  {"name":"telegram","color":"0088cc","description":"Telegram Bot API integration - message delivery, button interactions, logging."},
+  {"name":"driver-facing","color":"65a30d","description":"Any interface or interaction the driver sees or touches directly."},
+  {"name":"real-time","color":"ea580c","description":"Features requiring live data flow - WebSockets, polling, push notifications."},
+  {"name":"monitoring","color":"d97706","description":"Tracking, surveillance, or observability of active operations."},
+  {"name":"gps","color":"ca8a04","description":"Geolocation, tracking API integration, geofencing logic."},
+  {"name":"incidents","color":"be123c","description":"Deviation handling - delays, route changes, replacements, anything off-plan."},
+  {"name":"resilience","color":"78716c","description":"Fallback mechanisms, degraded modes, graceful failure handling."},
+  {"name":"fallback","color":"a8a29e","description":"Specific alternative procedures when primary systems are unavailable."},
+  {"name":"financial","color":"16a34a","description":"Anything that touches money - charges, rates, invoices, cost calculations."},
+  {"name":"settlement","color":"15803d","description":"End-of-service cost computation, daily cuts, reconciliation with contracts."},
+  {"name":"cancellations","color":"b91c1c","description":"Cancellation flows, charge/exoneration logic, approval escalation."},
+  {"name":"analytics","color":"8b5cf6","description":"Reporting, scoring, trend analysis, historical aggregations."},
+  {"name":"quality","color":"a855f7","description":"Driver/vehicle/provider evaluation, scoring systems, performance tracking."},
+  {"name":"layer-1","color":"1e1b4b","description":"Data Foundation - schemas, registries, role model. Build first."},
+  {"name":"layer-2","color":"1e3a5f","description":"Core Workflow - OS lifecycle, assignment, scheduling, operational orders."},
+  {"name":"layer-3","color":"3b5998","description":"Real-Time Operations - monitoring, incidents, degraded mode."},
+  {"name":"layer-4","color":"6b7280","description":"Financial & Analytics - settlement, cancellations, quality scoring."}
+]
+JSON
+)
+
+api_request() {
+  local method="$1"
+  local path="$2"
+  local data="${3:-}"
+
+  local url="${API_BASE}${path}"
+  local response
+
+  if [[ -n "$data" ]]; then
+    response=$(curl -sS \
+      -X "$method" \
+      -H "Authorization: token ${TOKEN}" \
+      -H "Accept: application/json" \
+      -H "Content-Type: application/json" \
+      --data "$data" \
+      "$url" \
+      -w $'\n%{http_code}')
+  else
+    response=$(curl -sS \
+      -X "$method" \
+      -H "Authorization: token ${TOKEN}" \
+      -H "Accept: application/json" \
+      "$url" \
+      -w $'\n%{http_code}')
+  fi
+
+  API_STATUS="${response##*$'\n'}"
+  API_BODY="${response%$'\n'*}"
+}
+
+is_2xx() {
+  [[ "$1" =~ ^2[0-9][0-9]$ ]]
+}
+
+validate_json_input() {
+  jq -e '
+    type == "array" and
+    all(.[];
+      type == "object" and
+      ((.title? // "") | type == "string" and (length > 0))
+    )
+  ' "$INPUT_FILE" >/dev/null
+}
+
+load_repo_labels() {
+  local page=1
+  local collected='[]'
+
+  while :; do
+    api_request "GET" "/repos/${OWNER}/${REPO}/labels?limit=100&page=${page}"
+
+    if ! is_2xx "$API_STATUS"; then
+      err "Failed to fetch labels (HTTP $API_STATUS): $API_BODY"
+      return 1
+    fi
+
+    local chunk
+    chunk=$(printf '%s' "$API_BODY" | jq -c '
+      if type == "array" then .
+      elif (type == "object" and (.data? | type == "array")) then .data
+      else [] end
+    ')
+
+    local chunk_len
+    chunk_len=$(printf '%s' "$chunk" | jq 'length')
+
+    collected=$(printf '%s\n%s\n' "$collected" "$chunk" | jq -sc 'add // []')
+
+    if (( chunk_len < 100 )); then
+      break
+    fi
+
+    page=$((page + 1))
+  done
+
+  LABELS_JSON="$collected"
+
+  LABEL_NAMES_JSON=$(printf '%s' "$LABELS_JSON" | jq -c '[.[].name] | unique')
+}
+
+create_label_from_catalog() {
+  local label_name="$1"
+  local spec
+
+  spec=$(printf '%s' "$LABEL_CATALOG_JSON" | jq -c --arg n "$label_name" '.[] | select(.name == $n)' | head -n 1)
+  if [[ -z "$spec" ]]; then
+    return 1
+  fi
+
+  if (( DRY_RUN == 1 )); then
+    log "DRY_RUN_CREATE_LABEL: ${label_name}"
+    return 0
+  fi
+
+  api_request "POST" "/repos/${OWNER}/${REPO}/labels" "$spec"
+
+  if is_2xx "$API_STATUS"; then
+    return 0
+  fi
+
+  # Label may already exist due to race / concurrent runs.
+  if [[ "$API_STATUS" == "409" ]]; then
+    return 0
+  fi
+
+  return 2
+}
+
+ensure_requested_labels_exist() {
+  local requested_names_json="$1"
+  local missing_json
+  local label
+  local created_any=0
+
+  missing_json=$(jq -cn \
+    --arg known "$LABEL_NAMES_JSON" \
+    --arg requested "$requested_names_json" \
+    '
+      ($known | fromjson? // []) as $known_a
+      | ($requested | fromjson? // []) as $requested_a
+      | [ $requested_a[] | strings | select(($known_a | index(.)) | not) ]
+      | unique
+    ')
+
+  while IFS= read -r label; do
+    [[ -z "$label" ]] && continue
+
+    create_label_from_catalog "$label"
+    case $? in
+      0)
+        log "LABEL_READY: ${label}"
+        created_any=1
+        ;;
+      1)
+        warnings_missing_labels=$((warnings_missing_labels + 1))
+        log "WARN_MISSING_LABELS: ${label} (not in built-in catalog)"
+        ;;
+      2)
+        warnings_missing_labels=$((warnings_missing_labels + 1))
+        err "LABEL_CREATE_FAILED: ${label} (HTTP ${API_STATUS}) ${API_BODY}"
+        ;;
+    esac
+  done < <(printf '%s' "$missing_json" | jq -r '.[]')
+
+  if (( DRY_RUN == 0 )) && (( created_any == 1 )); then
+    if ! load_repo_labels; then
+      err "Could not reload labels after creating missing labels."
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
+issue_exists_by_title() {
+  local title="$1"
+  local q
+  q=$(urlencode "$title")
+
+  api_request "GET" "/repos/${OWNER}/${REPO}/issues?state=all&type=issues&q=${q}&limit=50"
+
+  if ! is_2xx "$API_STATUS"; then
+    err "Failed to query existing issues for title '$title' (HTTP $API_STATUS): $API_BODY"
+    return 2
+  fi
+
+  local found
+  found=$(printf '%s' "$API_BODY" | jq -r --arg t "$title" '
+    (if type == "array" then . elif (type == "object" and (.data? | type == "array")) then .data else [] end)
+    | any(.[]; (.title == $t) and (.pull_request | not))
+  ')
+
+  if [[ "$found" == "true" ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+filter_labels_to_ids() {
+  local requested_names_json="$1"
+
+  REQUESTED_LABELS_JSON=$(printf '%s' "$requested_names_json" | jq -c '[.[] | strings]')
+
+  FILTERED_LABELS_JSON=$(jq -cn \
+    --arg labels "$LABELS_JSON" \
+    --arg requested "$REQUESTED_LABELS_JSON" \
+    '
+      ($labels | fromjson? // []) as $labels_a
+      | ($requested | fromjson? // []) as $requested_a
+      | [ $labels_a[] | select(.name as $n | ($requested_a | index($n))) | .id ]
+      | unique
+    ')
+
+  MISSING_LABELS_JSON=$(jq -cn \
+    --arg known "$LABEL_NAMES_JSON" \
+    --arg requested "$REQUESTED_LABELS_JSON" \
+    '
+      ($known | fromjson? // []) as $known_a
+      | ($requested | fromjson? // []) as $requested_a
+      | [ $requested_a[] | select(($known_a | index(.)) | not) ]
+      | unique
+    ')
+}
+
+build_issue_body() {
+  local source_id="$1"
+  local feature="$2"
+  local body="$3"
+
+  local metadata
+  metadata="## Source Metadata\n\n- Source ID: \`${source_id:-unknown}\`"
+
+  if [[ -n "$feature" && "$feature" != "null" ]]; then
+    metadata+="\n- Feature: \`${feature}\`"
+  fi
+
+  if [[ -n "$body" && "$body" != "null" ]]; then
+    printf '%b\n\n%s\n' "$metadata" "$body"
+  else
+    printf '%b\n' "$metadata"
+  fi
+}
+
+create_issue() {
+  local title="$1"
+  local body="$2"
+  local label_ids_json="$3"
+
+  local payload
+  payload=$(jq -cn \
+    --arg title "$title" \
+    --arg body "$body" \
+    --argjson labels "$label_ids_json" \
+    '{title:$title, body:$body, labels:$labels}')
+
+  api_request "POST" "/repos/${OWNER}/${REPO}/issues" "$payload"
+
+  if ! is_2xx "$API_STATUS"; then
+    return 1
+  fi
+
+  CREATED_ISSUE_NUMBER=$(printf '%s' "$API_BODY" | jq -r '.number // empty')
+  CREATED_ISSUE_ID=$(printf '%s' "$API_BODY" | jq -r '.id // empty')
+
+  if [[ -z "$CREATED_ISSUE_NUMBER" ]]; then
+    return 1
+  fi
+
+  return 0
+}
+
+attach_issue_to_project() {
+  local issue_number="$1"
+
+  # Prefer the repository-project endpoint used by newer Gitea-style APIs.
+  api_request "POST" "/repos/${OWNER}/${REPO}/projects/${PROJECT_ID}/issues/${issue_number}" ""
+
+  if is_2xx "$API_STATUS"; then
+    return 0
+  fi
+
+  # Fallback for instances exposing global project endpoint.
+  api_request "POST" "/projects/${PROJECT_ID}/issues/${issue_number}" ""
+
+  if is_2xx "$API_STATUS"; then
+    return 0
+  fi
+
+  return 1
+}
+
+OWNER=""
+REPO=""
+PROJECT_ID=""
+INPUT_FILE=""
+API_BASE="https://codeberg.org/api/v1"
+TOKEN_ENV="CODEBERG_TOKEN"
+DRY_RUN=0
+
+while (($#)); do
+  case "$1" in
+    --owner)
+      OWNER="${2:-}"
+      shift 2
+      ;;
+    --repo)
+      REPO="${2:-}"
+      shift 2
+      ;;
+    --project-id)
+      PROJECT_ID="${2:-}"
+      shift 2
+      ;;
+    --input)
+      INPUT_FILE="${2:-}"
+      shift 2
+      ;;
+    --api-base)
+      API_BASE="${2:-}"
+      shift 2
+      ;;
+    --token-env)
+      TOKEN_ENV="${2:-}"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      err "Unknown argument: $1"
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -z "$OWNER" || -z "$REPO" || -z "$PROJECT_ID" || -z "$INPUT_FILE" ]]; then
+  err "Missing required arguments."
+  usage
+  exit 1
+fi
+
+if [[ ! "$PROJECT_ID" =~ ^[0-9]+$ ]]; then
+  err "--project-id must be numeric."
+  exit 1
+fi
+
+API_BASE="${API_BASE%/}"
+
+require_cmd jq
+require_cmd curl
+
+if [[ ! -f "$INPUT_FILE" ]]; then
+  err "Input file not found: $INPUT_FILE"
+  exit 1
+fi
+
+if ! validate_json_input; then
+  err "Invalid input JSON. Expected an array of objects with non-empty string 'title'."
+  exit 1
+fi
+
+TOKEN="${!TOKEN_ENV:-}"
+if [[ -z "$TOKEN" ]]; then
+  err "Missing token. Export ${TOKEN_ENV}=<token>"
+  exit 1
+fi
+
+if ! load_repo_labels; then
+  exit 1
+fi
+
+created=0
+skipped_duplicate=0
+failed_create=0
+failed_project_attach=0
+warnings_missing_labels=0
+
+items_len=$(jq 'length' "$INPUT_FILE")
+log "Processing ${items_len} issue(s) for ${OWNER}/${REPO}, project ${PROJECT_ID}"
+
+for ((i=0; i<items_len; i++)); do
+  item=$(jq -c ".[$i]" "$INPUT_FILE")
+
+  source_id=$(printf '%s' "$item" | jq -r '.id // ""')
+  feature=$(printf '%s' "$item" | jq -r '.feature // ""')
+  title=$(printf '%s' "$item" | jq -r '.title')
+  body=$(printf '%s' "$item" | jq -r '.body // ""')
+  requested_labels=$(printf '%s' "$item" | jq -c '.labels // []')
+
+  log "---"
+  log "Item $((i + 1))/${items_len}: ${title}"
+
+  if issue_exists_by_title "$title"; then
+    log "SKIP_DUPLICATE: ${title}"
+    skipped_duplicate=$((skipped_duplicate + 1))
+    continue
+  else
+    rc=$?
+    if [[ "$rc" -eq 2 ]]; then
+      failed_create=$((failed_create + 1))
+      continue
+    fi
+  fi
+
+  if ! ensure_requested_labels_exist "$requested_labels"; then
+    failed_create=$((failed_create + 1))
+    continue
+  fi
+
+  filter_labels_to_ids "$requested_labels"
+
+  missing_count=$(printf '%s' "$MISSING_LABELS_JSON" | jq 'length')
+  if (( missing_count > 0 )); then
+    missing_csv=$(printf '%s' "$MISSING_LABELS_JSON" | jq -r 'join(", ")')
+    log "WARN_UNRESOLVED_LABELS: ${missing_csv}"
+  fi
+
+  final_body=$(build_issue_body "$source_id" "$feature" "$body")
+
+  if (( DRY_RUN == 1 )); then
+    kept_labels=$(printf '%s' "$FILTERED_LABELS_JSON" | jq -r 'map(tostring) | join(",")')
+    preview=$(printf '%s' "$final_body" | head -n 8)
+    log "DRY_RUN_CREATE: title=${title} label_ids=[${kept_labels}]"
+    log "DRY_RUN_BODY_PREVIEW:"
+    printf '%s\n' "$preview"
+    log "DRY_RUN_ATTACH_PROJECT: issue=<newly-created> project=${PROJECT_ID}"
+    continue
+  fi
+
+  if ! create_issue "$title" "$final_body" "$FILTERED_LABELS_JSON"; then
+    err "CREATE_FAILED: ${title} (HTTP ${API_STATUS}) ${API_BODY}"
+    failed_create=$((failed_create + 1))
+    continue
+  fi
+
+  created=$((created + 1))
+  log "CREATED: #${CREATED_ISSUE_NUMBER} ${title}"
+
+  if ! attach_issue_to_project "$CREATED_ISSUE_NUMBER"; then
+    err "PROJECT_ATTACH_FAILED: #${CREATED_ISSUE_NUMBER} -> project ${PROJECT_ID} (HTTP ${API_STATUS}) ${API_BODY}"
+    failed_project_attach=$((failed_project_attach + 1))
+  else
+    log "PROJECT_ATTACHED: #${CREATED_ISSUE_NUMBER} -> project ${PROJECT_ID}"
+  fi
+done
+
+log "=== Summary ==="
+log "created=${created}"
+log "skipped_duplicate=${skipped_duplicate}"
+log "failed_create=${failed_create}"
+log "failed_project_attach=${failed_project_attach}"
+log "warnings_missing_labels=${warnings_missing_labels}"
+
+if (( failed_create > 0 )); then
+  exit 1
+fi
+
+exit 0
